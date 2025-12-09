@@ -1,0 +1,18 @@
+{
+  "mappings": {
+    "personal-finances": {
+      "client": "Personal",
+      "project": "Finance App"
+    },
+    "notebook-ui": {
+      "client": "Internal",
+      "project": "UI Component Library"
+    },
+    "client-website": {
+      "client": "Acme Corp",
+      "project": "Website Redesign"
+    }
+  },
+  "defaultClient": "Development",
+  "hourlyRate": 150
+}

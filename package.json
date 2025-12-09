@@ -1,0 +1,26 @@
+{
+  "name": "claude-code-utils",
+  "version": "1.0.0",
+  "description": "Utilities for Claude Code - session export, time tracking, and more",
+  "main": "export-sessions.js",
+  "bin": {
+    "claude-sessions": "./export-sessions.js"
+  },
+  "scripts": {
+    "export": "node export-sessions.js",
+    "export:all": "node export-sessions.js --all",
+    "generate-config": "node export-sessions.js --generate-config > config.json"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "time-tracking",
+    "session-export",
+    "productivity"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
