@@ -29,6 +29,7 @@ const scriptDir = __dirname;
 const claudeDir = path.join(os.homedir(), '.claude');
 const historyFile = path.join(claudeDir, 'history.jsonl');
 const projectsDir = path.join(claudeDir, 'projects');
+const stateFile = path.join(claudeDir, 'export-state.json');
 
 // Parse command line arguments
 const args = process.argv.slice(2);
@@ -41,7 +42,10 @@ const options = {
   to: null,
   all: false,
   config: null,
-  verbose: false
+  verbose: false,
+  new: false,
+  exportProfile: null,
+  runExports: false
 };
 
 for (let i = 0; i < args.length; i++) {
@@ -59,10 +63,16 @@ for (let i = 0; i < args.length; i++) {
     options.repo = args[++i];
   } else if (args[i] === '--all') {
     options.all = true;
+  } else if (args[i] === '--new') {
+    options.new = true;
   } else if (args[i] === '--config' && args[i + 1]) {
     options.config = args[++i];
   } else if (args[i] === '--verbose' || args[i] === '-v') {
     options.verbose = true;
+  } else if (args[i] === '--export-profile' && args[i + 1]) {
+    options.exportProfile = args[++i];
+  } else if (args[i] === '--run-exports') {
+    options.runExports = true;
   } else if (args[i] === '--generate-config') {
     generateConfig();
     process.exit(0);
@@ -79,8 +89,11 @@ Options:
   --from <date>     Start date filter (YYYY-MM-DD)
   --to <date>       End date filter (YYYY-MM-DD)
   --all             Include all projects
+  --new             Export only sessions since last export
   --config <file>   Config file for repo→client mappings (default: ./config.json)
   --generate-config Generate a config file from discovered projects
+  --export-profile <name>  Run a specific export profile from config
+  --run-exports     Run all export profiles defined in config
   --verbose, -v     Show debug information
   --help            Show this help message
 
@@ -91,7 +104,19 @@ Config file format (JSON):
       "notebook-ui": { "client": "Internal", "project": "UI Library" }
     },
     "defaultClient": "Development",
-    "hourlyRate": 150
+    "hourlyRate": 150,
+    "exports": {
+      "client-a": {
+        "repositories": ["personal-finances", "notebook-ui"],
+        "output": "client-a-sessions.csv",
+        "format": "csv"
+      },
+      "client-b": {
+        "repositories": ["other-repo"],
+        "output": "exports/client-b.json",
+        "format": "json"
+      }
+    }
   }
 
 Examples:
@@ -99,6 +124,9 @@ Examples:
   node export-sessions.js --repo personal-finances
   node export-sessions.js --format json --output sessions.json
   node export-sessions.js --generate-config > config.json
+  node export-sessions.js --all --new  # Export only new sessions since last export
+  node export-sessions.js --export-profile client-a --new  # Run single profile
+  node export-sessions.js --run-exports --new  # Run all export profiles
 `);
     process.exit(0);
   }
@@ -168,12 +196,75 @@ function generateConfig() {
   console.log(JSON.stringify(config, null, 2));
 }
 
+/**
+ * Read the last export timestamp from state file
+ * @param {string} repoKey - Repository name or '_all' for all repos
+ * @returns {number|null} Timestamp in milliseconds, or null if no previous export
+ */
+function getLastExportTime(repoKey) {
+  try {
+    if (fs.existsSync(stateFile)) {
+      const state = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+
+      // Handle old format (single timestamp) - migrate to new format
+      if (typeof state.lastExportTime === 'number') {
+        return state.lastExportTime;
+      }
+
+      // New format: per-repository timestamps
+      // Fall back to _all timestamp if repo-specific entry doesn't exist
+      if (state.lastExportTime && typeof state.lastExportTime === 'object') {
+        return state.lastExportTime[repoKey] || state.lastExportTime['_all'] || null;
+      }
+    }
+  } catch (err) {
+    if (options.verbose) {
+      console.warn(`Warning: Could not read state file: ${err.message}`);
+    }
+  }
+  return null;
+}
+
+/**
+ * Save the current export timestamp to state file
+ * @param {string} repoKey - Repository name or '_all' for all repos
+ * @param {number} timestamp - Timestamp in milliseconds
+ */
+function saveLastExportTime(repoKey, timestamp) {
+  try {
+    let state = { lastExportTime: {} };
+
+    // Read existing state if present
+    if (fs.existsSync(stateFile)) {
+      const existing = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+
+      // Migrate old format to new format
+      if (typeof existing.lastExportTime === 'number') {
+        state.lastExportTime = { '_all': existing.lastExportTime };
+      } else if (existing.lastExportTime && typeof existing.lastExportTime === 'object') {
+        state.lastExportTime = existing.lastExportTime;
+      }
+    }
+
+    // Update the specific repo timestamp
+    state.lastExportTime[repoKey] = timestamp;
+
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+    if (options.verbose) {
+      console.log(`Saved export state for '${repoKey}' to: ${stateFile}`);
+    }
+  } catch (err) {
+    console.warn(`Warning: Could not save state file: ${err.message}`);
+  }
+}
+
 // Load config file if specified or exists
 let config = {
   mappings: {},
   defaultClient: '',
   defaultProject: '',
-  hourlyRate: null
+  hourlyRate: null,
+  exports: {}  // Export profiles: { profileName: { repositories: [], output: '', format: '' } }
 };
 
 const configPaths = [
@@ -420,9 +511,320 @@ function escapeTSV(value) {
   return String(value).replace(/\t/g, ' ').replace(/\r?\n/g, ' ');
 }
 
+/**
+ * Run a single export with the given options
+ * @param {Object} exportOpts - Export options
+ * @param {string} exportOpts.stateKey - Key for state tracking (e.g., 'profile:client-a' or '_all')
+ * @param {string[]} exportOpts.repositories - Array of repository names to include (null = all or use repo option)
+ * @param {string} exportOpts.repo - Single repository filter (alternative to repositories)
+ * @param {string} exportOpts.output - Output filename
+ * @param {string} exportOpts.format - Output format (csv, json, tsv)
+ * @param {boolean} exportOpts.useNew - Whether to use --new filtering
+ * @param {Date} exportOpts.from - Start date filter
+ * @param {Date} exportOpts.to - End date filter
+ * @param {boolean} exportOpts.all - Include all repositories
+ * @param {boolean} exportOpts.verbose - Show verbose output
+ * @param {string} exportOpts.label - Label for console output
+ * @returns {Object} Export results { sessions: number, output: string, error: string|null }
+ */
+function runExport(exportOpts) {
+  const {
+    stateKey,
+    repositories = null,
+    repo = null,
+    output = 'claude-sessions.csv',
+    format = 'csv',
+    useNew = false,
+    from = null,
+    to = null,
+    all = false,
+    verbose = false,
+    label = null
+  } = exportOpts;
+
+  const labelPrefix = label ? `[${label}] ` : '';
+  
+  if (verbose) {
+    console.log(`${labelPrefix}Running export...`);
+    console.log(`${labelPrefix}State key: ${stateKey}`);
+    if (repositories) console.log(`${labelPrefix}Repositories: ${repositories.join(', ')}`);
+  }
+
+  // Handle --new option: get last export time
+  let lastExportTime = null;
+  if (useNew) {
+    lastExportTime = getLastExportTime(stateKey);
+    if (lastExportTime) {
+      console.log(`${labelPrefix}Since last export: ${formatLocalDate(new Date(lastExportTime))}`);
+    } else if (verbose) {
+      console.log(`${labelPrefix}No previous export found, exporting all matching sessions`);
+    }
+  }
+
+  if (!fs.existsSync(historyFile)) {
+    return { sessions: 0, output: null, error: 'History file not found' };
+  }
+
+  // Read and parse history.jsonl
+  const content = fs.readFileSync(historyFile, 'utf-8');
+  const lines = content.split('\n').filter(l => l.trim());
+
+  // Parse all entries
+  const entries = [];
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+      if (entry.timestamp && entry.project) {
+        // Apply date filters
+        if (from && entry.timestamp < from.getTime()) continue;
+        if (to && entry.timestamp > to.getTime()) continue;
+        // Apply --new filter: only entries after last export
+        if (lastExportTime && entry.timestamp <= lastExportTime) continue;
+
+        entries.push({
+          timestamp: entry.timestamp,
+          project: entry.project,
+          message: entry.display || '',
+        });
+      }
+    } catch (err) {
+      // Skip invalid lines
+    }
+  }
+
+  // Filter entries by repositories or repo
+  let filteredEntries;
+  if (all && !repositories) {
+    filteredEntries = entries;
+  } else if (repositories && repositories.length > 0) {
+    // Filter by multiple repositories
+    const repoSet = new Set(repositories.map(r => r.toLowerCase()));
+    filteredEntries = entries.filter(e => {
+      const entryRepoName = getRepositoryName(e.project).toLowerCase();
+      return repoSet.has(entryRepoName);
+    });
+  } else if (repo) {
+    // Filter by single repo
+    filteredEntries = entries.filter(e => {
+      const entryRepoName = getRepositoryName(e.project).toLowerCase();
+      return entryRepoName === repo.toLowerCase();
+    });
+  } else {
+    filteredEntries = entries;
+  }
+
+  // Group entries into sessions
+  const SESSION_GAP_MS = 30 * 60 * 1000;
+  filteredEntries.sort((a, b) => a.timestamp - b.timestamp);
+
+  const sessions = [];
+  let currentSession = null;
+
+  for (const entry of filteredEntries) {
+    if (!currentSession) {
+      currentSession = {
+        project: entry.project,
+        repositoryName: getRepositoryName(entry.project),
+        startTime: entry.timestamp,
+        endTime: entry.timestamp,
+        messages: [entry.message],
+      };
+    } else if (entry.timestamp - currentSession.endTime > SESSION_GAP_MS || 
+               normalizeProjectPath(entry.project) !== normalizeProjectPath(currentSession.project)) {
+      sessions.push(currentSession);
+      currentSession = {
+        project: entry.project,
+        repositoryName: getRepositoryName(entry.project),
+        startTime: entry.timestamp,
+        endTime: entry.timestamp,
+        messages: [entry.message],
+      };
+    } else {
+      currentSession.endTime = entry.timestamp;
+      currentSession.messages.push(entry.message);
+    }
+  }
+
+  if (currentSession) {
+    sessions.push(currentSession);
+  }
+
+  // Sort by start time (most recent first)
+  sessions.sort((a, b) => b.startTime - a.startTime);
+
+  // Transform sessions to output format
+  const outputData = sessions.map((s) => {
+    const durationMs = calculateDurationMs(s.startTime, s.endTime);
+    const mapping = getMapping(s.repositoryName);
+    const topics = extractTopics(s.messages);
+    
+    return {
+      startDate: formatDateOnly(new Date(s.startTime)),
+      endDate: formatDateOnly(new Date(s.endTime)),
+      client: mapping.client,
+      project: mapping.project,
+      repository: s.repositoryName,
+      description: createDescription(s.messages, topics),
+      startTime: formatDate(new Date(s.startTime)),
+      endTime: formatDate(new Date(s.endTime)),
+      durationHours: parseFloat(formatDurationHours(durationMs)),
+      durationMinutes: parseInt(formatDurationMinutes(durationMs)),
+      messageCount: s.messages.length,
+      topics: topics,
+      projectPath: s.project,
+    };
+  });
+
+  // Generate output based on format
+  let outputContent;
+  const headers = ['Start Date', 'End Date', 'Client', 'Project', 'Repository', 'Description', 'Start Time', 'End Time', 'Duration (hours)', 'Duration (minutes)', 'Message Count', 'Topics', 'Project Path'];
+
+  if (format === 'json') {
+    outputContent = JSON.stringify(outputData, null, 2);
+  } else if (format === 'tsv') {
+    const rows = outputData.map(d => [
+      d.startDate, d.endDate, d.client, d.project, d.repository, d.description,
+      d.startTime, d.endTime, d.durationHours, d.durationMinutes,
+      d.messageCount, d.topics, d.projectPath
+    ].map(escapeTSV).join('\t'));
+    outputContent = [headers.join('\t'), ...rows].join('\n');
+  } else {
+    // CSV (default)
+    const rows = outputData.map(d => [
+      d.startDate, d.endDate, d.client, d.project, d.repository, d.description,
+      d.startTime, d.endTime, d.durationHours, d.durationMinutes,
+      d.messageCount, d.topics, d.projectPath
+    ].map(escapeCSV).join(','));
+    outputContent = [headers.join(','), ...rows].join('\n');
+  }
+
+  // Write output
+  fs.writeFileSync(output, outputContent);
+  console.log(`${labelPrefix}Exported ${sessions.length} sessions to ${output} (${format.toUpperCase()})`);
+
+  // Save export timestamp
+  saveLastExportTime(stateKey, Date.now());
+
+  return {
+    sessions: sessions.length,
+    output: output,
+    error: null,
+    data: outputData,
+    rawSessions: sessions
+  };
+}
+
+/**
+ * Run a single export profile from config
+ * @param {string} profileName - Name of the export profile
+ * @param {Object} profileConfig - Profile configuration
+ * @returns {Object} Export results
+ */
+function runExportProfile(profileName, profileConfig) {
+  const {
+    repositories = [],
+    output = `${profileName}-sessions.csv`,
+    format = 'csv'
+  } = profileConfig;
+
+  console.log(`\n=== Running export profile: ${profileName} ===`);
+  console.log(`Repositories: ${repositories.length > 0 ? repositories.join(', ') : 'all'}`);
+  console.log(`Output: ${output}`);
+
+  return runExport({
+    stateKey: `profile:${profileName}`,
+    repositories: repositories.length > 0 ? repositories : null,
+    output: output,
+    format: format,
+    useNew: options.new,
+    from: options.from,
+    to: options.to,
+    all: repositories.length === 0,
+    verbose: options.verbose,
+    label: profileName
+  });
+}
+
+/**
+ * Run all export profiles defined in config
+ * @returns {Object} Combined results from all profiles
+ */
+function runAllExportProfiles() {
+  const profiles = config.exports || {};
+  const profileNames = Object.keys(profiles);
+
+  if (profileNames.length === 0) {
+    console.error('No export profiles defined in config.');
+    console.error('Add an "exports" section to your config.json with profile definitions.');
+    process.exit(1);
+  }
+
+  console.log(`Running ${profileNames.length} export profile(s)...`);
+
+  const results = {};
+  let totalSessions = 0;
+
+  for (const profileName of profileNames) {
+    const result = runExportProfile(profileName, profiles[profileName]);
+    results[profileName] = result;
+    totalSessions += result.sessions;
+  }
+
+  console.log(`\n=== Export Summary ===`);
+  console.log(`Total profiles: ${profileNames.length}`);
+  console.log(`Total sessions: ${totalSessions}`);
+  for (const [name, result] of Object.entries(results)) {
+    console.log(`  ${name}: ${result.sessions} sessions -> ${result.output}`);
+  }
+
+  return results;
+}
+
 // Main execution
+if (options.runExports) {
+  // Run all export profiles
+  runAllExportProfiles();
+  process.exit(0);
+}
+
+if (options.exportProfile) {
+  // Run a specific export profile
+  const profiles = config.exports || {};
+  const profileConfig = profiles[options.exportProfile];
+
+  if (!profileConfig) {
+    console.error(`Export profile '${options.exportProfile}' not found in config.`);
+    const available = Object.keys(profiles);
+    if (available.length > 0) {
+      console.error(`Available profiles: ${available.join(', ')}`);
+    } else {
+      console.error('No export profiles defined in config.');
+    }
+    process.exit(1);
+  }
+
+  runExportProfile(options.exportProfile, profileConfig);
+  process.exit(0);
+}
+
+// Legacy single-export mode (original behavior)
 console.log('Parsing Claude Code history...');
 console.log(`History file: ${historyFile}`);
+
+// Determine the repo key for state tracking
+const repoKey = options.all ? '_all' : (options.repo || getRepositoryName(options.project));
+
+// Handle --new option: get last export time
+let lastExportTime = null;
+if (options.new) {
+  lastExportTime = getLastExportTime(repoKey);
+  if (lastExportTime) {
+    const repoLabel = repoKey === '_all' ? 'all repositories' : `'${repoKey}'`;
+    console.log(`Since last export (${repoLabel}): ${formatLocalDate(new Date(lastExportTime))}`);
+  } else {
+    console.log('No previous export found, exporting all matching sessions');
+  }
+}
 
 if (options.from) console.log(`From: ${formatDateOnly(options.from)}`);
 if (options.to) console.log(`To: ${formatDateOnly(options.to)}`);
@@ -447,7 +849,9 @@ for (const line of lines) {
       // Apply date filters
       if (options.from && entry.timestamp < options.from.getTime()) continue;
       if (options.to && entry.timestamp > options.to.getTime()) continue;
-      
+      // Apply --new filter: only entries after last export
+      if (lastExportTime && entry.timestamp <= lastExportTime) continue;
+
       entries.push({
         timestamp: entry.timestamp,
         project: entry.project,
@@ -539,7 +943,8 @@ const outputData = sessions.map((s) => {
   const topics = extractTopics(s.messages);
   
   return {
-    date: formatDateOnly(new Date(s.startTime)),
+    startDate: formatDateOnly(new Date(s.startTime)),
+    endDate: formatDateOnly(new Date(s.endTime)),
     client: mapping.client,
     project: mapping.project,
     repository: s.repositoryName,
@@ -556,13 +961,13 @@ const outputData = sessions.map((s) => {
 
 // Generate output based on format
 let output;
-const headers = ['Date', 'Client', 'Project', 'Repository', 'Description', 'Start Time', 'End Time', 'Duration (hours)', 'Duration (minutes)', 'Message Count', 'Topics', 'Project Path'];
+const headers = ['Start Date', 'End Date', 'Client', 'Project', 'Repository', 'Description', 'Start Time', 'End Time', 'Duration (hours)', 'Duration (minutes)', 'Message Count', 'Topics', 'Project Path'];
 
 if (options.format === 'json') {
   output = JSON.stringify(outputData, null, 2);
 } else if (options.format === 'tsv') {
   const rows = outputData.map(d => [
-    d.date, d.client, d.project, d.repository, d.description,
+    d.startDate, d.endDate, d.client, d.project, d.repository, d.description,
     d.startTime, d.endTime, d.durationHours, d.durationMinutes,
     d.messageCount, d.topics, d.projectPath
   ].map(escapeTSV).join('\t'));
@@ -570,7 +975,7 @@ if (options.format === 'json') {
 } else {
   // CSV (default)
   const rows = outputData.map(d => [
-    d.date, d.client, d.project, d.repository, d.description,
+    d.startDate, d.endDate, d.client, d.project, d.repository, d.description,
     d.startTime, d.endTime, d.durationHours, d.durationMinutes,
     d.messageCount, d.topics, d.projectPath
   ].map(escapeCSV).join(','));
@@ -581,13 +986,16 @@ if (options.format === 'json') {
 fs.writeFileSync(options.output, output);
 console.log(`\nExported ${sessions.length} sessions to ${options.output} (${options.format.toUpperCase()})`);
 
+// Save export timestamp for --new option
+saveLastExportTime(repoKey, Date.now());
+
 // Print summary
 if (sessions.length > 0) {
   console.log('\nRecent sessions (newest first):');
   outputData.slice(0, 10).forEach((s, i) => {
     const duration = formatDurationHuman(s.durationMinutes * 60000);
     const desc = s.description.length > 50 ? s.description.substring(0, 47) + '...' : s.description;
-    console.log(`  ${i + 1}. ${s.date} | ${s.repository} | ${duration} | ${desc}`);
+    console.log(`  ${i + 1}. ${s.startDate} | ${s.repository} | ${duration} | ${desc}`);
   });
   
   if (sessions.length > 10) {
