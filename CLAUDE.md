@@ -1,63 +1,68 @@
-# CLAUDE.md
+# CLAUDE.md — Claude Code Utils
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides project-specific guidance for this codebase. For universal workflow rules, see the root `../CLAUDE.md`.
 
-## Project Overview
+---
 
-Claude Code Utils is a Node.js utility for exporting Claude Code session history to CSV/JSON/TSV formats for time tracking and billing purposes. It parses `~/.claude/history.jsonl` to extract session data.
+## Project Context
 
-## Commands
+- **Product:** CLI tool for exporting Claude Code session history to CSV/JSON/TSV for time tracking and billing
+- **Stack:** Node.js (single-file CLI)
+- **Architecture:** Single file (`export-sessions.js`) that parses `~/.claude/history.jsonl`
+- **Deploy:** Run directly with `node`
+
+## Build & Run
 
 ```bash
 # Export all sessions
 node export-sessions.js --all
 
-# Export specific repository
-node export-sessions.js --repo <name>
+# Incremental export (only new since last run)
+node export-sessions.js --all --new
 
-# Export with date range
-node export-sessions.js --all --from 2025-12-01 --to 2025-12-08
+# Export specific repo with date range
+node export-sessions.js --repo <name> --from 2025-12-01 --to 2025-12-08
 
 # Export to specific format
 node export-sessions.js --all --format json --output sessions.json
 
-# Generate config template from discovered projects
+# Run all export profiles defined in config
+node export-sessions.js --run-exports --new
+
+# Generate config template
 node export-sessions.js --generate-config > config.json
 
-# Verbose mode for debugging
+# Verbose debugging
 node export-sessions.js --all -v
-
-# Export only new sessions since last export (incremental)
-node export-sessions.js --all --new
 ```
 
 ## Architecture
 
-Single-file CLI tool (`export-sessions.js`) with these key functions:
+### Key Design Decisions
 
-- **Session grouping**: Entries are grouped into sessions by 30+ minute gaps in activity (`SESSION_GAP_MS`)
-- **Smart descriptions**: `createDescription()` analyzes message content to generate work summaries using action detection (bug fix, feature, etc.) and area detection (database, API, UI, etc.)
-- **Topic extraction**: `extractTopics()` identifies keywords for categorization
-- **Config resolution**: Searches multiple paths for config.json: `--config` arg → script directory → cwd → `~/.claude/time-tracking.json`
-- **Incremental exports**: State file (`~/.claude/export-state.json`) tracks last export timestamp per repository for `--new` option
+- **Session grouping:** Entries grouped into sessions by 30+ minute gaps (`SESSION_GAP_MS`) or project change
+- **Smart descriptions:** `createDescription()` generates work summaries via action/area detection
+- **Config resolution:** `--config` arg → script directory → cwd → `~/.claude/time-tracking.json`
+- **Incremental exports:** State file (`~/.claude/export-state.json`) tracks last export timestamp per repo/profile
 
-## Config File
+### Config File
 
-Config maps repository names to client/project for billing:
+Maps repository names to client/project for billing, with optional export profiles:
 
 ```json
 {
-  "mappings": {
-    "repo-name": { "client": "Client Name", "project": "Project Name" }
-  },
+  "mappings": { "repo-name": { "client": "Client Name", "project": "Project Name" } },
   "defaultClient": "Development",
-  "hourlyRate": 150
+  "hourlyRate": 150,
+  "exports": {
+    "profile-name": { "repositories": ["repo-a"], "output": "exports/profile.csv", "format": "csv" }
+  }
 }
 ```
 
-## Data Flow
+### Data Flow
 
-1. Read `~/.claude/history.jsonl` (JSONL format with timestamp, project, display fields)
+1. Read `~/.claude/history.jsonl`
 2. Filter by date range and repository
 3. Group entries into sessions (30min gap = new session)
 4. Generate descriptions and topics from message content
